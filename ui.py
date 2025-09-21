@@ -1,6 +1,6 @@
 # ui.py
 # sculptr.ai — Modern Dark UI (PySide6)
-#fawadtestt
+#fawadtest
 
 from __future__ import annotations
 from renderer import SimpleGLViewport
