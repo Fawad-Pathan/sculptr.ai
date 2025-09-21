@@ -3,6 +3,17 @@
 #fawadtest
 
 from __future__ import annotations
+
+# ---- hotfix: make Key_Shift_L/R exist even if renderer asks for them ----
+from PySide6.QtCore import Qt
+if not hasattr(Qt, "Key_Shift_L"):
+    Qt.Key_Shift_L = Qt.Key_Shift
+if not hasattr(Qt, "Key_Shift_R"):
+    Qt.Key_Shift_R = Qt.Key_Shift
+# -------------------------------------------------------------------------
+import os
+OBJ_PATH = os.path.join(os.path.dirname(__file__), "cube.obj")  # or rename to your file
+
 from renderer import SimpleGLViewport
 import sys
 from PySide6.QtCore import Qt, QSize
@@ -301,7 +312,7 @@ class Main(QMainWindow):
         viewport_container.setLayout(viewport_wrap)
 
         self.viewport_top_bar = ViewportBar()
-        self.viewport_widget  = SimpleGLViewport(bg_hex=BG, line_hex=TEXT, obj_path="cube.obj")
+        self.viewport_widget = SimpleGLViewport(bg_hex=BG, line_hex=TEXT, obj_path=OBJ_PATH)
         viewport_wrap.addWidget(self.viewport_top_bar, 0)
         viewport_wrap.addWidget(self.viewport_widget, 1)
 
