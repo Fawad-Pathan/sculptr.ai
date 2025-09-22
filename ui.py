@@ -14,6 +14,10 @@ if not hasattr(Qt, "Key_Shift_R"):
 import os
 OBJ_PATH = os.path.join(os.path.dirname(__file__), "cube.obj")  # or rename to your file
 
+import ai.generator as _g
+print("Using generator at:", _g.__file__)
+
+from ai.generator import GeneratorEngine
 from renderer import SimpleGLViewport
 import sys
 from PySide6.QtCore import Qt, QSize
@@ -280,8 +284,8 @@ class RightPanel(QWidget):
 
     def _placeholder_tab(self, title: str) -> QWidget:
         w = QWidget(); v = QVBoxLayout(w); v.setSpacing(12)
-        t = QLabel(f"{title} (placeholder)"); t.setStyleSheet(f"color:{TEXT}; font-weight:600;")
-        t2= QLabel("Wire functionality later."); t2.setStyleSheet(f"color:{SUBTLE};")
+        t = QLabel(f"{title} "); t.setStyleSheet(f"color:{TEXT}; font-weight:600;")
+        t2= QLabel("Ask Anything."); t2.setStyleSheet(f"color:{SUBTLE};")
         card = QFrame(); card.setObjectName("Card")
         lay = QVBoxLayout(card); lay.setContentsMargins(14,14,14,14); lay.addWidget(t); lay.addWidget(t2)
         v.addWidget(card); v.addStretch(1)
@@ -341,6 +345,27 @@ class Main(QMainWindow):
         # Menubar + actions
         self._build_menubar()
         self._connect_menu_actions()
+
+        # Simple generator engine
+        base_dir = os.path.dirname(__file__)
+        self._gen = GeneratorEngine(out_dir=os.path.join(base_dir, "outputs"))
+
+        # Hook the "→" button
+        self._right_panel.go.clicked.connect(self._on_generate_clicked)
+
+
+    def _on_generate_clicked(self):
+        prompt = self._right_panel.prompt.text().strip()
+        if not prompt:
+            return
+        btn = self._right_panel.go
+        btn.setEnabled(False); btn.setText("…")
+        try:
+            result = self._gen.generate(prompt)
+            if result.ok and result.mesh_path:
+                self.viewport_widget.load_new_obj(result.mesh_path)
+        finally:
+            btn.setEnabled(True); btn.setText("→")
 
     def _build_menubar(self):
         mb = self.menuBar()

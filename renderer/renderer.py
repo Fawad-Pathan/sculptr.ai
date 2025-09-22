@@ -1,260 +1,351 @@
-# renderer/renderer.py — OBJ/cube viewer + Blender-style grid floor
+# renderer/renderer.py
+# Simple QOpenGLWidget 3D viewer with:
+# - OBJ loader (triangulates n-gons)
+# - Grid floor like Blender
+# - Free-fly camera (WASD + mouse look)
+# - Basic OpenGL fixed-function lighting
+# - reset_view() and load_new_obj() for ui.py
+
 from __future__ import annotations
-import os, math
+import math, os, time
 from typing import List, Tuple
 
-from PySide6.QtCore import Qt, QTimer, QElapsedTimer
-from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-
-from OpenGL.GL import (
-    glClearColor, glClear, glViewport, glEnable, glDisable, glLineWidth,
-    glMatrixMode, glLoadIdentity, glTranslatef, glRotatef, glBegin, glEnd,
-    glVertex3f, glColor3f, glColor4f, glPolygonMode, glBlendFunc,
-    GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST, GL_CULL_FACE,
-    GL_PROJECTION, GL_MODELVIEW, GL_TRIANGLES, GL_FRONT_AND_BACK, GL_FILL,
-    GL_LINE, GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA
-)
-from OpenGL.GLU import gluPerspective
-try:
-    from OpenGL.GLUT import glutInit
-except Exception:
-    glutInit = None
-
+from PySide6.QtCore import Qt, QPoint, QTimer
+from OpenGL.GL import *
+from OpenGL.GLU import gluPerspective, gluLookAt
 
 def _hex_to_rgbf(h: str) -> Tuple[float, float, float]:
-    h = h.lstrip("#"); return (int(h[0:2],16)/255.0, int(h[2:4],16)/255.0, int(h[4:6],16)/255.0)
+    h = h.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join([c * 2 for c in h])
+    r = int(h[0:2], 16) / 255.0
+    g = int(h[2:4], 16) / 255.0
+    b = int(h[4:6], 16) / 255.0
+    return r, g, b
 
+def _normalize(v):
+    x, y, z = v
+    l = math.sqrt(x*x + y*y + z*z) or 1.0
+    return (x/l, y/l, z/l)
+
+def _cross(a, b):
+    ax, ay, az = a; bx, by, bz = b
+    return (ay*bz - az*by, az*bx - ax*bz, ax*by - ay*bx)
+
+def _sub(a,b):
+    return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
+
+def _add(a,b):
+    return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
+
+def _mul(v, s: float):
+    return (v[0]*s, v[1]*s, v[2]*s)
 
 class SimpleGLViewport(QOpenGLWidget):
-    """
-    Controls:
-      A/D = orbit yaw, W/S = zoom, ↑/↓ = pitch, R = reset, G = toggle grid
-    Loads OBJ (triangulates n-gons) or falls back to a unit cube.
-    """
-
-    def __init__(self, parent=None, bg_hex="#1b1b1f", line_hex="#E6E6EA", obj_path: str | None = "cube.obj"):
+    def __init__(self, parent=None, bg_hex="#1b1b1f", line_hex="#E6E6EA", obj_path=None):
         super().__init__(parent)
-
-        fmt = QSurfaceFormat(); fmt.setRenderableType(QSurfaceFormat.OpenGL)
-        fmt.setVersion(2,1); fmt.setProfile(QSurfaceFormat.NoProfile); fmt.setDepthBufferSize(24)
-        self.setFormat(fmt)
-
-        # theme
-        self._bg = (*_hex_to_rgbf(bg_hex), 1.0)
-        self._mesh_color = _hex_to_rgbf(line_hex)
-
-        # camera
-        self._yaw, self._pitch, self._dist, self._fov = 30.0, -20.0, 3.5, 60.0
-
-        # controls
-        self._keys = set()
-        self._orbit_speed_deg, self._pitch_speed_deg, self._zoom_speed = 90.0, 60.0, 2.5
-
-        # timing
-        self._timer = QTimer(self); self._timer.timeout.connect(self._tick); self._timer.start(16)
-        self._elapsed = QElapsedTimer(); self._elapsed.start()
+        self._bg = _hex_to_rgbf(bg_hex)
+        self._line = _hex_to_rgbf(line_hex)
 
         # mesh
-        self._tris: List[Tuple[Tuple[float,float,float], Tuple[float,float,float], Tuple[float,float,float]]] = []
-        self._bbox = None
-        self.model_label = "BUILT-IN"
-
-        # grid settings (Y=0 plane)
+        self._verts: List[Tuple[float,float,float]] = []
+        self._faces: List[Tuple[int,int,int]] = []
+        self._vnorms: List[Tuple[float,float,float]] = []  # per-vertex normals
+        self._bbox = None     # (minx,miny,minz,maxx,maxy,maxz)
+        self._center = (0.0, 0.0, 0.0)
         self._grid_enabled = True
-        self._grid_spacing = 1.0       # world units between lines
-        self._grid_half_lines = 60     # extends both +/-
-        self._grid_major_every = 10    # thicker every N lines
 
-        # try to load mesh
+        # camera (free-fly)
+        self._yaw = 35.0
+        self._pitch = -20.0
+        self._dist = 3.5         # framing distance used by reset
+        self._cam_pos = (0.0, 0.75, 3.5)  # starting pos slightly above ground
+        self._move_speed = 1.5
+        self._keys = set()
+
+        # mouse
+        self._last_mouse = QPoint()
+        self._dragging_look = False
+
+        # timer for continuous movement
+        self._last_t = time.perf_counter()
+        self._timer = QTimer(self); self._timer.timeout.connect(self._tick); self._timer.start(16)
+
+        self.setFocusPolicy(Qt.StrongFocus)  # capture WASD
+
+        # optionally load obj
         if obj_path and os.path.exists(obj_path):
             self._load_obj(obj_path)
-            if not self._tris:
-                self._make_unit_cube()
-            else:
-                self._update_bounds(); self._frame_to_fit()
-                self.model_label = os.path.basename(obj_path)
+            self._frame_to_fit()
+
+    # ------------- public API (used by ui.py) -------------
+    def reset_view(self):
+        if self._bbox:
+            self._frame_to_fit()
         else:
-            self._make_unit_cube()
+            # default
+            self._yaw, self._pitch = 35.0, -20.0
+            self._cam_pos = (0.0, 0.75, 3.5)
+            self._dist = 3.5
+        self.update()
 
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setMinimumSize(640, 400)
+    def load_new_obj(self, path: str):
+        if os.path.exists(path):
+            self._load_obj(path)
+            self._frame_to_fit()
+            self.update()
 
-    # ---------- GL ----------
+    # ------------- GL lifecycle -------------
     def initializeGL(self):
-        if glutInit is not None:
-            try: glutInit()
-            except Exception: pass
-        glClearColor(*self._bg)
+        r,g,b = self._bg
+        glClearColor(r, g, b, 1.0)
         glEnable(GL_DEPTH_TEST)
-        glEnable(GL_CULL_FACE)
-        glLineWidth(1.4)
 
-    def resizeGL(self, w:int, h:int):
-        glViewport(0, 0, max(1,w), max(1,h))
+        # lighting
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+        glLightfv(GL_LIGHT0, GL_POSITION, (5.0, 8.0, 5.0, 1.0))     # pos
+        glLightfv(GL_LIGHT0, GL_DIFFUSE,  (0.95, 0.95, 0.95, 1.0))
+        glLightfv(GL_LIGHT0, GL_SPECULAR, (0.65, 0.65, 0.65, 1.0))
+        glLightfv(GL_LIGHT0, GL_AMBIENT,  (0.15, 0.15, 0.18, 1.0))
+
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, (0.25, 0.25, 0.25, 1.0))
+        glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32.0)
+        glShadeModel(GL_SMOOTH)
+
+    def resizeGL(self, w, h):
+        if h == 0: h = 1
+        glViewport(0, 0, w, h)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(45.0, w/float(h), 0.05, 500.0)
+        glMatrixMode(GL_MODELVIEW)
 
     def paintGL(self):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        # projection
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        aspect = max(1e-3, self.width()/max(1.0, float(self.height())))
-        gluPerspective(self._fov, aspect, 0.01, 1000.0)
+        # camera
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        fwd, right, up = self._basis()
+        target = _add(self._cam_pos, fwd)
+        gluLookAt(self._cam_pos[0], self._cam_pos[1], self._cam_pos[2],
+                  target[0],        target[1],        target[2],
+                  up[0],            up[1],            up[2])
 
-        # view
-        glMatrixMode(GL_MODELVIEW); glLoadIdentity()
-        glTranslatef(0.0, 0.0, -self._dist)
-        glRotatef(-self._pitch, 1,0,0)
-        glRotatef(-self._yaw,   0,1,0)
-
-        # grid first (so mesh occludes it)
+        # draw grid (unlit lines)
         if self._grid_enabled:
+            glDisable(GL_LIGHTING)
             self._draw_grid()
+            glEnable(GL_LIGHTING)
 
-        # mesh solid
-        r,g,b = self._mesh_color
-        glColor3f(r,g,b)
-        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-        glBegin(GL_TRIANGLES)
-        for a,b,c in self._tris: glVertex3f(*a); glVertex3f(*b); glVertex3f(*c)
-        glEnd()
+        # draw mesh (lit)
+        self._draw_mesh()
 
-        # wire overlay
-        glDisable(GL_CULL_FACE)
-        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glLineWidth(1.0)
-        glBegin(GL_TRIANGLES)
-        for a,b,c in self._tris: glVertex3f(*a); glVertex3f(*b); glVertex3f(*c)
-        glEnd()
-        glEnable(GL_CULL_FACE); glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-
-    # ---------- Grid ----------
-    def _draw_grid(self):
-        # subtle gray lines with alpha fade; axes colored
-        minor_rgba = (0.72, 0.74, 0.80, 0.12)
-        major_rgba = (0.78, 0.80, 0.88, 0.25)
-        x_axis     = (1.00, 0.25, 0.30, 0.90)   # X = red
-        z_axis     = (0.25, 0.95, 0.35, 0.90)   # Z = green
-
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        size = self._grid_spacing * self._grid_half_lines
-
-        # lines parallel to X (varying Z)
-        glLineWidth(1.0)
-        glBegin(GL_LINE)
-        glEnd()  # (no-op; keeps PyOpenGL happy when switching widths)
-
-        for i in range(-self._grid_half_lines, self._grid_half_lines + 1):
-            z = i * self._grid_spacing
-            # fade with distance from center
-            t = 1.0 - min(1.0, abs(i) / float(self._grid_half_lines))
-            fade = 0.18 + 0.55 * (t**1.5)  # non-linear for nicer falloff
-
-            if i == 0:
-                glLineWidth(1.8); glBegin(GL_LINES); glColor4f(*x_axis)  # X-axis line is along Z=0? (actually that's Z axis visually)
-                glVertex3f(-size, 0.0, 0.0); glVertex3f(size, 0.0, 0.0); glEnd()
-            else:
-                rgba = major_rgba if (i % self._grid_major_every == 0) else minor_rgba
-                glLineWidth(1.0 if rgba is minor_rgba else 1.4)
-                r,g,b,a = rgba; glBegin(GL_LINES); glColor4f(r,g,b, a*fade)
-                glVertex3f(-size, 0.0, z); glVertex3f(size, 0.0, z); glEnd()
-
-        # lines parallel to Z (varying X)
-        for i in range(-self._grid_half_lines, self._grid_half_lines + 1):
-            x = i * self._grid_spacing
-            t = 1.0 - min(1.0, abs(i) / float(self._grid_half_lines))
-            fade = 0.18 + 0.55 * (t**1.5)
-
-            if i == 0:
-                glLineWidth(1.8); glBegin(GL_LINES); glColor4f(*z_axis)  # Z-axis
-                glVertex3f(0.0, 0.0, -size); glVertex3f(0.0, 0.0, size); glEnd()
-            else:
-                rgba = major_rgba if (i % self._grid_major_every == 0) else minor_rgba
-                glLineWidth(1.0 if rgba is minor_rgba else 1.4)
-                r,g,b,a = rgba; glBegin(GL_LINES); glColor4f(r,g,b, a*fade)
-                glVertex3f(x, 0.0, -size); glVertex3f(x, 0.0, size); glEnd()
-
-        glDisable(GL_BLEND)
-
-    # ---------- Update loop ----------
+    # ------------- per-frame update -------------
     def _tick(self):
-        dt = max(0.0, self._elapsed.restart()/1000.0)
-        self._apply_controls(dt)
+        now = time.perf_counter()
+        dt = max(0.0, min(0.05, now - self._last_t))
+        self._last_t = now
+        self._update_movement(dt)
         self.update()
 
-    def _apply_controls(self, dt: float):
-        if Qt.Key_A in self._keys: self._yaw = (self._yaw - self._orbit_speed_deg*dt) % 360.0
-        if Qt.Key_D in self._keys: self._yaw = (self._yaw + self._orbit_speed_deg*dt) % 360.0
-        if Qt.Key_W in self._keys: self._dist = max(0.25, self._dist - self._zoom_speed*dt)
-        if Qt.Key_S in self._keys: self._dist = self._dist + self._zoom_speed*dt
-        if Qt.Key_Up in self._keys:   self._pitch = max(-89.0, self._pitch - self._pitch_speed_deg*dt)
-        if Qt.Key_Down in self._keys: self._pitch = min( 89.0, self._pitch + self._pitch_speed_deg*dt)
-
-    # ---------- Input ----------
+    # ------------- input -------------
     def keyPressEvent(self, e):
         self._keys.add(e.key())
         if e.key() == Qt.Key_R:
-            self._yaw, self._pitch, self._dist = 30.0, -20.0, 3.5
+            self.reset_view()
         elif e.key() == Qt.Key_G:
             self._grid_enabled = not self._grid_enabled
+        super().keyPressEvent(e)
 
     def keyReleaseEvent(self, e):
-        if e.isAutoRepeat(): return
+        # make sure to remove even if auto-repeated
         self._keys.discard(e.key())
+        super().keyReleaseEvent(e)
 
-    # ---------- Mesh helpers ----------
-    def _make_unit_cube(self):
-        s=0.5
-        v=[(-s,-s,-s),( s,-s,-s),( s, s,-s),(-s, s,-s),
-           (-s,-s, s),( s,-s, s),( s, s, s),(-s, s, s)]
-        idx=[(0,1,2),(0,2,3),(4,5,6),(4,6,7),(0,1,5),(0,5,4),
-             (2,3,7),(2,7,6),(1,2,6),(1,6,5),(0,3,7),(0,7,4)]
-        self._tris=[(v[a],v[b],v[c]) for a,b,c in idx]
-        self._update_bounds()
+    def mousePressEvent(self, e):
+        self.setFocus()  # ensure key events go here
+        if e.button() == Qt.RightButton:
+            self._dragging_look = True
+        self._last_mouse = e.position().toPoint()
+        super().mousePressEvent(e)
 
-    def _load_obj(self, path:str):
-        verts: List[Tuple[float,float,float]] = []
-        faces: List[List[int]] = []
-        with open(path,"r",encoding="utf-8") as f:
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.RightButton:
+            self._dragging_look = False
+        super().mouseReleaseEvent(e)
+
+    def mouseMoveEvent(self, e):
+        p = e.position().toPoint()
+        dx = p.x() - self._last_mouse.x()
+        dy = p.y() - self._last_mouse.y()
+        self._last_mouse = p
+
+        if self._dragging_look:
+            # mouse sensitivity
+            self._yaw   += dx * 0.2
+            self._pitch += -dy * 0.2
+            self._pitch = max(-89.9, min(89.9, self._pitch))
+        self.update()
+        super().mouseMoveEvent(e)
+
+    def wheelEvent(self, e):
+        # dolly forward/back
+        delta = e.angleDelta().y() / 120.0
+        speed = self._move_speed * 0.75
+        fwd, _, _ = self._basis()
+        self._cam_pos = _add(self._cam_pos, _mul(fwd, delta * speed))
+        self.update()
+        super().wheelEvent(e)
+
+    def _update_movement(self, dt: float):
+        if not self._keys:
+            return
+        # hold Shift to move faster
+        fast = (Qt.Key_Shift in self._keys)
+        spd = self._move_speed * (2.25 if fast else 1.0)
+
+        fwd, right, up = self._basis()
+        move = (0.0, 0.0, 0.0)
+        if Qt.Key_W in self._keys: move = _add(move, fwd)
+        if Qt.Key_S in self._keys: move = _sub(move, fwd)
+        if Qt.Key_D in self._keys: move = _add(move, right)
+        if Qt.Key_A in self._keys: move = _sub(move, right)
+        if Qt.Key_E in self._keys: move = _add(move, up)      # up
+        if Qt.Key_Q in self._keys: move = _sub(move, up)      # down
+
+        if move != (0.0,0.0,0.0):
+            move = _normalize(move)
+            self._cam_pos = _add(self._cam_pos, _mul(move, spd * dt))
+
+    # ------------- camera math -------------
+    def _basis(self):
+        # forward from yaw/pitch (degrees)
+        cp = math.radians(self._pitch)
+        cy = math.radians(self._yaw)
+        fwd = (math.cos(cp)*math.sin(cy), math.sin(cp), math.cos(cp)*math.cos(cy))
+        fwd = _normalize(fwd)
+        world_up = (0.0, 1.0, 0.0)
+        right = _normalize(_cross(fwd, world_up))
+        up = _normalize(_cross(right, fwd))
+        return fwd, right, up
+
+    # ------------- drawing -------------
+    def _draw_grid(self, half=20, step=1.0):
+        # axis colors + faint grid
+        lr, lg, lb = (0.35, 0.35, 0.40)
+        xr, xg, xb = (0.85, 0.25, 0.25)   # X red
+        zr, zg, zb = (0.25, 0.70, 0.85)   # Z cyan-ish
+
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        for i in range(-half, half+1):
+            if i == 0:
+                glColor3f(xr,xg,xb)  # X axis
+                glVertex3f(-half*step, 0.0, 0.0); glVertex3f(half*step, 0.0, 0.0)
+                glColor3f(zr,zg,zb)  # Z axis
+                glVertex3f(0.0, 0.0, -half*step); glVertex3f(0.0, 0.0, half*step)
+            else:
+                glColor3f(lr,lg,lb)
+                # lines parallel to Z
+                glVertex3f(i*step, 0.0, -half*step); glVertex3f(i*step, 0.0, half*step)
+                # lines parallel to X
+                glVertex3f(-half*step, 0.0, i*step); glVertex3f(half*step, 0.0, i*step)
+        glEnd()
+
+    def _draw_mesh(self):
+        if not self._verts or not self._faces:
+            return
+
+        glColor3f(*self._line)
+
+        # pick flat vs smooth (smooth if we computed normals)
+        smooth = bool(self._vnorms) and (len(self._vnorms) == len(self._verts))
+        glBegin(GL_TRIANGLES)
+        if smooth:
+            for a,b,c in self._faces:
+                na = self._vnorms[a]; nb = self._vnorms[b]; nc = self._vnorms[c]
+                ax,ay,az = self._verts[a]; bx,by,bz = self._verts[b]; cx,cy,cz = self._verts[c]
+                glNormal3f(*na); glVertex3f(ax,ay,az)
+                glNormal3f(*nb); glVertex3f(bx,by,bz)
+                glNormal3f(*nc); glVertex3f(cx,cy,cz)
+        else:
+            # flat shading per face
+            for a,b,c in self._faces:
+                v0 = self._verts[a]; v1 = self._verts[b]; v2 = self._verts[c]
+                n = _normalize(_cross(_sub(v1,v0), _sub(v2,v0)))
+                glNormal3f(*n)
+                glVertex3f(*v0); glVertex3f(*v1); glVertex3f(*v2)
+        glEnd()
+
+    # ------------- OBJ loading + fit -------------
+    def _load_obj(self, path: str):
+        verts = []; faces = []
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if not line or line.startswith("#"): continue
                 parts = line.strip().split()
                 if not parts: continue
-                if parts[0]=="v" and len(parts)>=4:
-                    verts.append((float(parts[1]),float(parts[2]),float(parts[3])))
-                elif parts[0]=="f" and len(parts)>=4:
-                    idxs=[]
-                    for tok in parts[1:]:
-                        base=tok.split("/")[0]
-                        if not base: continue
-                        i=int(base)
-                        if i<0: i=len(verts)+i+1
-                        idxs.append(i-1)
-                    if len(idxs)>=3: faces.append(idxs)
+                if parts[0] == "v" and len(parts) >= 4:
+                    x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                    verts.append((x, y, z))
+                elif parts[0] == "f" and len(parts) >= 4:
+                    idxs = []
+                    for p in parts[1:]:
+                        # forms: "v", "v/t", "v//n", "v/t/n"
+                        v = p.split("/")[0]
+                        if not v: continue
+                        idx = int(v)
+                        if idx < 0: idx = len(verts) + idx + 1
+                        idxs.append(idx-1)  # OBJ -> 0-based
+                    # triangulate fan
+                    for i in range(1, len(idxs)-1):
+                        faces.append((idxs[0], idxs[i], idxs[i+1]))
 
-        tris=[]
-        for face in faces:
-            if len(face)==3:
-                a,b,c=face; tris.append((verts[a],verts[b],verts[c]))
-            else:
-                for i in range(1,len(face)-1):
-                    tris.append((verts[face[0]],verts[face[i]],verts[face[i+1]]))
-        self._tris=tris
-        self._update_bounds()
+        self._verts = verts
+        self._faces = faces
+        self._compute_bounds()
+        self._compute_vertex_normals()
 
-    def _update_bounds(self):
-        if not self._tris: self._bbox=None; return
-        xs=[p[0] for tri in self._tris for p in tri]
-        ys=[p[1] for tri in self._tris for p in tri]
-        zs=[p[2] for tri in self._tris for p in tri]
-        self._bbox=(min(xs),min(ys),min(zs),max(xs),max(ys),max(zs))
+    def _compute_bounds(self):
+        if not self._verts:
+            self._bbox = None
+            self._center = (0.0, 0.0, 0.0)
+            return
+        xs = [v[0] for v in self._verts]
+        ys = [v[1] for v in self._verts]
+        zs = [v[2] for v in self._verts]
+        self._bbox = (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+        self._center = ((min(xs)+max(xs))/2.0, (min(ys)+max(ys))/2.0, (min(zs)+max(zs))/2.0)
+
+    def _compute_vertex_normals(self):
+        if not self._verts or not self._faces:
+            self._vnorms = []
+            return
+        acc = [(0.0,0.0,0.0) for _ in self._verts]
+        for a,b,c in self._faces:
+            v0 = self._verts[a]; v1 = self._verts[b]; v2 = self._verts[c]
+            n = _normalize(_cross(_sub(v1,v0), _sub(v2,v0)))
+            acc[a] = _add(acc[a], n)
+            acc[b] = _add(acc[b], n)
+            acc[c] = _add(acc[c], n)
+        self._vnorms = [_normalize(n) for n in acc]
 
     def _frame_to_fit(self):
-        if not self._bbox: return
-        minx,miny,minz,maxx,maxy,maxz=self._bbox
-        size=max(maxx-minx, maxy-miny, maxz-minz, 1e-6)
-        radius=size*0.6
-        fov_rad=math.radians(self._fov*0.5)
-        self._dist=max(0.25, radius/max(1e-6, math.sin(fov_rad))*1.2)
-        self._yaw,self._pitch=30.0,-20.0
+        if not self._bbox:
+            self._cam_pos = (0.0, 0.75, 3.5)
+            self._yaw, self._pitch = 35.0, -20.0
+            self._dist = 3.5
+            return
+        minx,miny,minz, maxx,maxy,maxz = self._bbox
+        size = max(maxx-minx, maxy-miny, maxz-minz)
+        size = max(size, 0.25)
+        self._dist = 2.2 * size
+        self._yaw, self._pitch = 35.0, -20.0
+        # put camera back from center along -forward
+        fwd, _, _ = self._basis()
+        self._cam_pos = _sub(self._center, _mul(fwd, self._dist))
